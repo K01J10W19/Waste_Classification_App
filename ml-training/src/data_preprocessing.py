@@ -202,10 +202,12 @@ def split_and_copy(
                 dest_dir = splits_dir / split_name / major_class
                 dest_dir.mkdir(parents=True, exist_ok=True)
                 for src in files:
-                    # Prefix variant name to avoid filename collisions across variants
-                    dest = dest_dir / f"{variant_name}__{src.name}"
-                    if dest.exists():
-                        dest = dest_dir / f"{variant_name}__{src.parent.name}__{src.name}"
+                    # Multiple Kaggle sub-categories (e.g. 11 → plastic) all share
+                    # the same base filenames (Image_1.png … Image_N.png).
+                    # Include the Kaggle category folder name to guarantee uniqueness:
+                    #   <variant>__<kaggle_category>__<original_filename>
+                    kaggle_cat = src.parent.parent.name  # e.g. "plastic_water_bottles"
+                    dest = dest_dir / f"{variant_name}__{kaggle_cat}__{src.name}"
                     shutil.copy2(src, dest)
                 stats[major_class][split_name] += len(files)
 
