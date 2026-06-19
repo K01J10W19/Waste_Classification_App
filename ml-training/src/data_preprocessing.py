@@ -30,46 +30,41 @@ from pathlib import Path
 # Categories absent from this mapping are skipped with a warning.
 # ---------------------------------------------------------------------------
 CATEGORY_TO_CLASS: dict[str, str] = {
-    # Plastic
-    "Disposable Plastic Cutlery": "plastic",
-    "Plastic Bags & Wrappers": "plastic",
-    "Plastic Beverage Bottles": "plastic",
-    "Plastic Containers": "plastic",
-    "Plastic Cups & Cups Lids": "plastic",
-    "Plastic Detergent Bottles": "plastic",
-    "Plastic Food Containers": "plastic",
-    "Plastic Shopping Bags": "plastic",
-    "Plastic Soda Bottles": "plastic",
-    "Plastic Straws": "plastic",
-    "Plastic Trash Bags": "plastic",
-    "Plastic Water Bottles": "plastic",
-    "Styrofoam Cups": "plastic",
-    "Styrofoam Food Containers": "plastic",
-    # Paper
-    "Magazines": "paper",
-    "Newspaper": "paper",
-    "Office Paper": "paper",
-    "Paper Bags": "paper",
-    "Paper Cups": "paper",
-    "Paper Straws": "paper",
-    # Glass
-    "Glass Beverage Bottles": "glass",
-    "Glass Cosmetic Containers": "glass",
-    "Glass Food Jars": "glass",
-    # Metal
-    "Aerosol Cans": "metal",
-    "Aluminum Food Cans": "metal",
-    "Aluminum Soda Cans": "metal",
-    "Steel Food Cans": "metal",
-    # Cardboard
-    "Cardboard Boxes": "cardboard",
-    "Cardboard Paper": "cardboard",
-    # Organic
-    "Coffee Grounds": "organic",
-    "Eggshells": "organic",
-    "Food Waste": "organic",
-    "Tea Bags": "organic",
-    # Deliberately excluded (out of scope): Clothing, Shoes
+    # Plastic (14 sub-categories)
+    "disposable_plastic_cutlery": "plastic",
+    "plastic_cup_lids": "plastic",
+    "plastic_detergent_bottles": "plastic",
+    "plastic_food_containers": "plastic",
+    "plastic_shopping_bags": "plastic",
+    "plastic_soda_bottles": "plastic",
+    "plastic_straws": "plastic",
+    "plastic_trash_bags": "plastic",
+    "plastic_water_bottles": "plastic",
+    "styrofoam_cups": "plastic",
+    "styrofoam_food_containers": "plastic",
+    # Paper (5 sub-categories)
+    "magazines": "paper",
+    "newspaper": "paper",
+    "office_paper": "paper",
+    "paper_cups": "paper",
+    # Glass (3 sub-categories)
+    "glass_beverage_bottles": "glass",
+    "glass_cosmetic_containers": "glass",
+    "glass_food_jars": "glass",
+    # Metal (4 sub-categories)
+    "aerosol_cans": "metal",
+    "aluminum_food_cans": "metal",
+    "aluminum_soda_cans": "metal",
+    "steel_food_cans": "metal",
+    # Cardboard (2 sub-categories)
+    "cardboard_boxes": "cardboard",
+    "cardboard_packaging": "cardboard",
+    # Organic (4 sub-categories)
+    "coffee_grounds": "organic",
+    "eggshells": "organic",
+    "food_waste": "organic",
+    "tea_bags": "organic",
+    # Deliberately excluded: clothing, shoes (out of scope), real_world (mixed meta-folder)
 }
 
 SPLITS = {"train": 0.80, "val": 0.10, "test": 0.10}
