@@ -1,207 +1,313 @@
 """
-Maps the 30 Kaggle dataset categories to 6 major waste classes and
-splits images into train/val/test sets (80/10/10 stratified by class).
+Phase 2 — Data preprocessing pipeline for the Kaggle waste dataset.
 
-Dataset: Recyclable and Household Waste Classification
-Source:  https://www.kaggle.com/datasets/alistairking/recyclable-and-household-waste-classification
+Maps 30 Kaggle categories → 7 major waste classes, performs data cleaning,
+and builds stratified 70/15/15 train/val/test splits.
 
-Expected raw layout (after Kaggle download + unzip):
-    ml-training/data/raw/images/<Category Name>/default/*.jpg
+Dataset layout (after Kaggle download):
+    data/raw/images/images/<category>/<default|real_world>/<Image_N.png>
 
-Output layout:
-    ml-training/data/splits/train/<class>/
-    ml-training/data/splits/val/<class>/
-    ml-training/data/splits/test/<class>/
+    - <category>   : one of 30 folder names (snake_case)
+    - default      : studio / controlled-background images (250 per category)
+    - real_world   : in-situ / environmental images (250 per category)
+
+Output:
+    data/splits/<train|val|test>/<class>/<variant>__<filename>
+
+    Both variants are present in every split so models learn from
+    both controlled and real-world appearances.
+
+Stats saved to:
+    outputs/dataset_stats.json
 
 Usage:
     python ml-training/src/data_preprocessing.py
-    python ml-training/src/data_preprocessing.py --raw-dir path/to/raw --seed 42
+    python ml-training/src/data_preprocessing.py --raw-dir path/to/raw --seed 42 --no-clean
 """
 
 import argparse
+import json
 import random
 import shutil
 from collections import defaultdict
 from pathlib import Path
 
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
-# Category → major class mapping
-# Keys are exact Kaggle folder names (case-insensitive match in code below).
-# Categories absent from this mapping are skipped with a warning.
+# 7-class mapping — all 30 Kaggle categories included, nothing excluded
 # ---------------------------------------------------------------------------
 CATEGORY_TO_CLASS: dict[str, str] = {
-    # Plastic (14 sub-categories)
+    # Plastic (11 sub-categories)
     "disposable_plastic_cutlery": "plastic",
-    "plastic_cup_lids": "plastic",
-    "plastic_detergent_bottles": "plastic",
-    "plastic_food_containers": "plastic",
-    "plastic_shopping_bags": "plastic",
-    "plastic_soda_bottles": "plastic",
-    "plastic_straws": "plastic",
-    "plastic_trash_bags": "plastic",
-    "plastic_water_bottles": "plastic",
-    "styrofoam_cups": "plastic",
-    "styrofoam_food_containers": "plastic",
-    # Paper (5 sub-categories)
-    "magazines": "paper",
-    "newspaper": "paper",
+    "plastic_cup_lids":           "plastic",
+    "plastic_detergent_bottles":  "plastic",
+    "plastic_food_containers":    "plastic",
+    "plastic_shopping_bags":      "plastic",
+    "plastic_soda_bottles":       "plastic",
+    "plastic_straws":             "plastic",
+    "plastic_trash_bags":         "plastic",
+    "plastic_water_bottles":      "plastic",
+    "styrofoam_cups":             "plastic",
+    "styrofoam_food_containers":  "plastic",
+    # Paper (4 sub-categories)
+    "magazines":    "paper",
+    "newspaper":    "paper",
     "office_paper": "paper",
-    "paper_cups": "paper",
+    "paper_cups":   "paper",
     # Glass (3 sub-categories)
-    "glass_beverage_bottles": "glass",
-    "glass_cosmetic_containers": "glass",
-    "glass_food_jars": "glass",
+    "glass_beverage_bottles":   "glass",
+    "glass_cosmetic_containers":"glass",
+    "glass_food_jars":          "glass",
     # Metal (4 sub-categories)
-    "aerosol_cans": "metal",
+    "aerosol_cans":       "metal",
     "aluminum_food_cans": "metal",
     "aluminum_soda_cans": "metal",
-    "steel_food_cans": "metal",
+    "steel_food_cans":    "metal",
     # Cardboard (2 sub-categories)
-    "cardboard_boxes": "cardboard",
-    "cardboard_packaging": "cardboard",
+    "cardboard_boxes":      "cardboard",
+    "cardboard_packaging":  "cardboard",
     # Organic (4 sub-categories)
     "coffee_grounds": "organic",
-    "eggshells": "organic",
-    "food_waste": "organic",
-    "tea_bags": "organic",
-    # Deliberately excluded: clothing, shoes (out of scope), real_world (mixed meta-folder)
+    "eggshells":      "organic",
+    "food_waste":     "organic",
+    "tea_bags":       "organic",
+    # Textiles (2 sub-categories)
+    "clothing": "textiles",
+    "shoes":    "textiles",
 }
 
-SPLITS = {"train": 0.80, "val": 0.10, "test": 0.10}
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+SPLITS: dict[str, float] = {"train": 0.70, "val": 0.15, "test": 0.15}
+IMAGE_EXTS: set[str] = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+IMAGE_VARIANTS: set[str] = {"default", "real_world"}
 
 
-def collect_images(raw_dir: Path) -> dict[str, list[Path]]:
+# ---------------------------------------------------------------------------
+# Data cleaning
+# ---------------------------------------------------------------------------
+
+def _is_valid_image(path: Path) -> bool:
+    """Return True if PIL can fully decode the image (catches truncated files)."""
+    try:
+        with Image.open(path) as img:
+            img.load()
+        return True
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Collection
+# ---------------------------------------------------------------------------
+
+def collect_images(
+    raw_dir: Path,
+    clean: bool = True,
+) -> tuple[dict[str, dict[str, list[Path]]], int, list[Path]]:
     """
-    Walk raw_dir and group image paths by major class.
+    Walk raw_dir, group image paths by (major_class, variant).
 
-    The Kaggle dataset has two known layouts:
-        raw/images/<Category>/default/*.jpg   (nested)
-        raw/<Category>/*.jpg                  (flat)
-    Both are handled by recursing into every subdirectory.
+    Returns:
+        class_images : {major_class: {"default": [...], "real_world": [...]}}
+        n_corrupt    : number of files that failed PIL decode and were skipped
+        corrupt_list : list of corrupt file paths
     """
-    # Build a lookup: lower-case category name → major class
+    if not PIL_AVAILABLE and clean:
+        print("[WARNING] Pillow not installed — skipping data cleaning (--no-clean implied).")
+        clean = False
+
     lookup = {k.lower(): v for k, v in CATEGORY_TO_CLASS.items()}
+    class_images: dict[str, dict[str, list[Path]]] = defaultdict(lambda: defaultdict(list))
+    corrupt_list: list[Path] = []
 
-    class_images: dict[str, list[Path]] = defaultdict(list)
-    skipped_dirs: set[str] = set()
-
-    # Find all category-level directories: any directory whose name matches a
-    # known category (case-insensitive).
-    for path in sorted(raw_dir.rglob("*")):
-        if not path.is_dir():
+    for cat_dir in sorted(raw_dir.rglob("*")):
+        if not cat_dir.is_dir():
             continue
-        major_class = lookup.get(path.name.lower())
+        major_class = lookup.get(cat_dir.name.lower())
         if major_class is None:
-            skipped_dirs.add(path.name)
             continue
-        # Collect image files directly inside this directory (and subfolders
-        # like the "default/" sub-layer).
-        for img in path.rglob("*"):
-            if img.is_file() and img.suffix.lower() in IMAGE_EXTS:
-                class_images[major_class].append(img)
 
-    unknown = skipped_dirs - {"images", "raw", "default", "splits", "processed"}
-    if unknown:
-        print(f"[WARNING] Skipped unrecognized category directories: {sorted(unknown)}")
+        # Collect from each image-variant subfolder (default / real_world)
+        variant_dirs = sorted(
+            d for d in cat_dir.iterdir()
+            if d.is_dir() and d.name in IMAGE_VARIANTS
+        )
 
-    return dict(class_images)
+        if not variant_dirs:
+            # Flat layout: images sit directly in the category folder
+            variant_dirs_iter = [(cat_dir, "default")]
+        else:
+            variant_dirs_iter = [(v, v.name) for v in variant_dirs]
 
+        for variant_path, variant_name in variant_dirs_iter:
+            for img in sorted(variant_path.iterdir()):
+                if not (img.is_file() and img.suffix.lower() in IMAGE_EXTS):
+                    continue
+                if clean and not _is_valid_image(img):
+                    corrupt_list.append(img)
+                    continue
+                class_images[major_class][variant_name].append(img)
+
+    n_corrupt = len(corrupt_list)
+    return dict(class_images), n_corrupt, corrupt_list
+
+
+# ---------------------------------------------------------------------------
+# Split & copy
+# ---------------------------------------------------------------------------
 
 def split_and_copy(
-    class_images: dict[str, list[Path]],
+    class_images: dict[str, dict[str, list[Path]]],
     splits_dir: Path,
     seed: int,
-) -> None:
-    """Stratified split per class, then copy files into splits_dir."""
+) -> dict:
+    """
+    Stratified 70/15/15 split per (major_class × variant), then copy into splits_dir.
+
+    Splitting within each variant independently ensures train/val/test each
+    receive a proportional mix of studio (default) and real-world images.
+    """
     rng = random.Random(seed)
-    stats: dict[str, dict[str, int]] = {}
+    stats: dict[str, dict] = {}
 
-    for major_class, images in sorted(class_images.items()):
-        shuffled = images[:]
-        rng.shuffle(shuffled)
+    for major_class, variants in sorted(class_images.items()):
+        stats[major_class] = {s: 0 for s in SPLITS}
+        stats[major_class]["total"] = 0
+        stats[major_class]["by_variant"] = {}
 
-        n = len(shuffled)
-        n_train = int(n * SPLITS["train"])
-        n_val = int(n * SPLITS["val"])
-        # Remainder goes to test to avoid rounding loss
-        buckets = {
-            "train": shuffled[:n_train],
-            "val": shuffled[n_train : n_train + n_val],
-            "test": shuffled[n_train + n_val :],
-        }
-        stats[major_class] = {}
+        for variant_name, images in sorted(variants.items()):
+            shuffled = images[:]
+            rng.shuffle(shuffled)
 
-        for split_name, files in buckets.items():
-            dest_dir = splits_dir / split_name / major_class
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            for src in files:
-                # Preserve original filename; add class prefix to avoid
-                # collisions when multiple Kaggle sub-categories map to same class.
-                dest = dest_dir / src.name
-                if dest.exists():
-                    # Disambiguate by including the immediate parent folder name.
-                    dest = dest_dir / f"{src.parent.name}__{src.name}"
-                shutil.copy2(src, dest)
-            stats[major_class][split_name] = len(files)
+            n = len(shuffled)
+            n_train = int(n * SPLITS["train"])
+            n_val = int(n * SPLITS["val"])
+            # remainder → test to avoid rounding loss
+
+            buckets: dict[str, list[Path]] = {
+                "train": shuffled[:n_train],
+                "val":   shuffled[n_train : n_train + n_val],
+                "test":  shuffled[n_train + n_val :],
+            }
+
+            stats[major_class]["by_variant"][variant_name] = {
+                s: len(b) for s, b in buckets.items()
+            }
+
+            for split_name, files in buckets.items():
+                dest_dir = splits_dir / split_name / major_class
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                for src in files:
+                    # Prefix variant name to avoid filename collisions across variants
+                    dest = dest_dir / f"{variant_name}__{src.name}"
+                    if dest.exists():
+                        dest = dest_dir / f"{variant_name}__{src.parent.name}__{src.name}"
+                    shutil.copy2(src, dest)
+                stats[major_class][split_name] += len(files)
+
+        stats[major_class]["total"] = sum(stats[major_class][s] for s in SPLITS)
 
     return stats
 
 
-def print_summary(stats: dict[str, dict[str, int]]) -> None:
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+
+def print_summary(stats: dict, n_corrupt: int) -> None:
+    classes = sorted(stats.keys())
     header = f"{'Class':<12} {'Train':>6} {'Val':>6} {'Test':>6} {'Total':>7}"
     print("\n" + header)
     print("-" * len(header))
-    grand = {"train": 0, "val": 0, "test": 0}
-    for cls, counts in sorted(stats.items()):
-        total = sum(counts.values())
+    grand = {s: 0 for s in SPLITS}
+    for cls in classes:
+        row = stats[cls]
         print(
-            f"{cls:<12} {counts['train']:>6} {counts['val']:>6} {counts['test']:>6} {total:>7}"
+            f"{cls:<12} {row['train']:>6} {row['val']:>6} {row['test']:>6} {row['total']:>7}"
         )
-        for k in grand:
-            grand[k] += counts[k]
+        for s in SPLITS:
+            grand[s] += row[s]
     print("-" * len(header))
     gt = sum(grand.values())
-    print(f"{'TOTAL':<12} {grand['train']:>6} {grand['val']:>6} {grand['test']:>6} {gt:>7}\n")
+    print(f"{'TOTAL':<12} {grand['train']:>6} {grand['val']:>6} {grand['test']:>6} {gt:>7}")
+    if n_corrupt:
+        print(f"\n[INFO] Corrupt files removed during cleaning: {n_corrupt}")
+    print()
 
+
+def save_stats(stats: dict, n_corrupt: int, corrupt_list: list[Path], outputs_dir: Path) -> None:
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "split_ratios": SPLITS,
+        "n_corrupt_removed": n_corrupt,
+        "corrupt_files": [str(p) for p in corrupt_list],
+        "classes": sorted(stats.keys()),
+        "per_class": stats,
+    }
+    out = outputs_dir / "dataset_stats.json"
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    print(f"Stats saved to: {out}")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     default_raw = repo_root / "ml-training" / "data" / "raw"
     default_splits = repo_root / "ml-training" / "data" / "splits"
+    default_outputs = repo_root / "ml-training" / "outputs"
 
     parser = argparse.ArgumentParser(description="Preprocess Kaggle waste dataset.")
-    parser.add_argument("--raw-dir", type=Path, default=default_raw)
+    parser.add_argument("--raw-dir",    type=Path, default=default_raw)
     parser.add_argument("--splits-dir", type=Path, default=default_splits)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--outputs-dir",type=Path, default=default_outputs)
+    parser.add_argument("--seed",       type=int,  default=42)
+    parser.add_argument("--no-clean",   action="store_true",
+                        help="Skip PIL data-cleaning pass (faster, unsafe)")
     args = parser.parse_args()
 
-    print(f"Raw data dir : {args.raw_dir}")
-    print(f"Splits dir   : {args.splits_dir}")
+    print(f"Raw data dir  : {args.raw_dir}")
+    print(f"Splits dir    : {args.splits_dir}")
+    print(f"Data cleaning : {'OFF' if args.no_clean else 'ON (PIL decode check)'}")
 
     if not args.raw_dir.exists() or not any(args.raw_dir.iterdir()):
         print(
             "\n[ERROR] Raw data directory is empty or does not exist.\n"
-            "Download the dataset from Kaggle first:\n"
-            "  kaggle datasets download -d alistairking/recyclable-and-household-waste-classification\n"
-            "Then unzip into ml-training/data/raw/\n"
+            "Download the dataset first:\n"
+            "  kaggle datasets download "
+            "-d alistairking/recyclable-and-household-waste-classification "
+            "-p ml-training/data/raw --unzip\n"
         )
         raise SystemExit(1)
 
-    print("\nScanning images …")
-    class_images = collect_images(args.raw_dir)
+    print("\nScanning and cleaning images …")
+    class_images, n_corrupt, corrupt_list = collect_images(
+        args.raw_dir, clean=not args.no_clean
+    )
 
     if not class_images:
-        print("[ERROR] No images found. Check that the raw directory layout matches expectations.")
+        print("[ERROR] No images found — check raw directory layout.")
         raise SystemExit(1)
 
-    found_classes = sorted(class_images.keys())
-    total_images = sum(len(v) for v in class_images.values())
-    print(f"Found {total_images} images across {len(found_classes)} classes: {found_classes}")
+    total = sum(
+        len(imgs)
+        for variants in class_images.values()
+        for imgs in variants.values()
+    )
+    print(f"Found {total} valid images across {len(class_images)} classes "
+          f"({n_corrupt} corrupt files removed)")
 
     print("\nSplitting and copying …")
     stats = split_and_copy(class_images, args.splits_dir, seed=args.seed)
-    print_summary(stats)
+    print_summary(stats, n_corrupt)
+    save_stats(stats, n_corrupt, corrupt_list, args.outputs_dir)
     print(f"Done. Splits written to: {args.splits_dir}")
 
 
